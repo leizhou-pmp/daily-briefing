@@ -9,7 +9,7 @@ import json
 import os
 import re
 
-from . import gemini, news, topics
+from . import dedupe, gemini, news, topics
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(ROOT, "state", "history.json")
@@ -62,7 +62,7 @@ def section_prompt(ctx, title, minutes, brief, avoid):
 {avoid}
 
 只依据上面提供的新闻素材、行情数据和你有把握的背景知识来写，素材里没有的最新事实不要编造，挑最重要的讲而不是逐条罗列。直接输出这一段的口播稿，{int(n*0.9)} 到 {int(n*1.1)} 字（严格控制篇幅，这一段约 {minutes} 分钟），不要加标题，不要开场白和过渡语，第一句直接进入内容。
-口播稿写完后，单独一行写 ===要点===，下一行给出一个 JSON 字符串数组，列出本段讲到的每条新闻或主题的简短标题（每条 15 字以内），用于以后去重。"""
+口播稿写完后，单独一行写 ===要点===，下一行给出一个 JSON 数组，每个元素形如 {{"title": "15 字以内的中文短标题", "src": 所用素材的编号}}，列出本段讲到的每条新闻或主题，没有用素材时 src 写 0，用于以后查重。"""
 
 
 def parse(text):
@@ -76,13 +76,21 @@ def parse(text):
     else:
         body, heads = text, []
     body = re.sub(r"[*#>`_]+", "", body).strip()
-    return body, [str(h) for h in heads]
+    return body, [h if isinstance(h, dict) else {"title": str(h), "src": 0} for h in heads]
 
 
 def write_section(ctx, title, minutes, brief, avoid, items=()):
-    text, _ = gemini.generate(section_prompt(ctx, title, minutes, brief, avoid), search=False)
-    sources = [{"title": it["title"], "uri": it["link"]} for it in items]
-    body, heads = parse(text)
+    text, _ = gemini.generate(section_prompt(ctx, title, minutes, brief, avoid))
+    body, raw = parse(text)
+    heads, used, sources = [], [], []
+    for h in raw:
+        t, src = str(h.get("title", "")).strip(), h.get("src", 0)
+        item = items[src - 1] if isinstance(src, int) and 0 < src <= len(items) else None
+        if t:
+            heads.append(t)
+            used.append({"title": t, "source": item["title"] if item else ""})
+        if item:
+            sources.append({"title": item["title"], "uri": item["link"]})
     target = minutes * CHARS_PER_MIN
     if len(body) < target * 0.7:  # 太短就让模型扩写一次
         more, s2 = gemini.generate(
@@ -96,7 +104,8 @@ def write_section(ctx, title, minutes, brief, avoid, items=()):
             f"删掉次要细节和铺垫。保持简洁播报风格，直接输出压缩后的全文，不要任何说明。\n\n{body}", search=False)
         body = re.sub(r"[*#>`_]+", "", short).strip()
     print(f"  {title}: {len(body)} 字, {len(heads)} 条要点")
-    return {"title": title, "body": body, "heads": heads, "sources": sources}
+    return {"title": title, "body": body, "heads": heads, "used": used, "sources": sources,
+            "plan": (title, minutes, brief, avoid, items)}
 
 
 def main():
@@ -121,9 +130,8 @@ def main():
         "profile": "【听众档案】\n" + (profile or "准备移居悉尼，公司 DW Building 位于悉尼 Padstow，行业是幕墙、扶手栏杆、门窗；计划先在公司附近租房。"),
     }
 
-    recent = eps[-8:]
-    recent_heads = [h for e in recent for h in e.get("heads", [])]
-    avoid = AVOID_TMPL.format(items="；".join(recent_heads) or "（暂无）")
+    covered = dedupe.load(args.date)
+    avoid = AVOID_TMPL.format(items="；".join(dedupe.titles(covered)) or "（暂无）")
     used = {k: [e.get(k) for e in eps if e.get(k)] for k in ("culture", "industry", "life")}
 
     picks = {}
@@ -136,7 +144,7 @@ def main():
         return f"自选一个之前没讲过的主题（已讲过：{'；'.join(used[key])}）。{desc}"
 
     print("抓取新闻素材 ...")
-    mat = {c: news.gather(c) for c in news.FEEDS}
+    mat = {c: dedupe.fresh(news.gather(c, limit=60), covered)[:25] for c in news.FEEDS}
     market = news.market_snapshot()
     for c, items in mat.items():
         print(f"  {c}: {len(items)} 条")
@@ -144,9 +152,9 @@ def main():
 
     plan = [
         ("澳洲要闻", 2.5, "挑 3 条过去 24 小时内澳洲（优先悉尼/新州）最重要的新闻：利率、房租房价、移民签证、生活成本、政策等。新闻必须用“第一条，……第二条，……第三条，……”的方式依次编号播报，每条开头先用一句话说标题。" + m("australia"), avoid, mat["australia"]),
-        ("澳洲文化与历史", 2.5, topic_brief("culture", "讲得有故事性，最后落到“这对我融入当地有什么帮助”，比如和同事、邻居相处时可以怎么用。"), ""),
+        ("澳洲文化与历史", 2.5, topic_brief("culture", "讲清事实和对融入当地的实际用处。"), avoid),
         ("行业观察", 3, topic_brief("industry", "面向在悉尼做幕墙、门窗、扶手栏杆的从业者：讲清规范/标准要点、相关大公司与竞争情况、近期景气度或大项目，尽量给具体可用的信息；如有本周相关行业新闻可先简短带一句。") + m("industry"), avoid, mat["industry"]),
-        ("澳洲生活小课堂", 2.5, topic_brief("life", "讲实操：步骤、费用大概多少、常见坑、需要准备什么，帮助一家人尽快适应悉尼生活。"), ""),
+        ("澳洲生活小课堂", 2.5, topic_brief("life", "讲实操：步骤、费用大概多少、常见坑、需要准备什么，帮助尽快适应悉尼生活。"), avoid),
         ("中国要闻", 2.5, "挑 3 条过去 24 小时中国最重要的新闻：经济数据、重大政策、中澳关系、人民币汇率等。新闻必须用“第一条，……第二条，……第三条，……”的方式依次编号播报，每条开头先用一句话说标题。" + m("china"), avoid, mat["china"]),
         ("全球大事", 2.5, "挑 3 条过去 24 小时全球最重要的事：地缘政治、美联储与美国经济、大宗商品等。新闻必须用“第一条，……第二条，……第三条，……”的方式依次编号播报，每条开头先用一句话说标题。" + m("world"), avoid, mat["world"]),
         ("理财观察", 2.5, ("固定跟踪三个品种：纳斯达克指数、标普500指数、黄金。根据下面的行情数据讲清最新点位和近一周、近一个月的涨跌，"
@@ -159,8 +167,24 @@ def main():
 
     print(f"生成 {args.date} {SLOT_CN[args.slot]} ...")
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=int(os.environ.get("GEN_WORKERS", "4"))) as pool:
+    with ThreadPoolExecutor(max_workers=int(os.environ.get("GEN_WORKERS", "2"))) as pool:
         sections = list(pool.map(lambda row: write_section(ctx, *row), plan))
+
+    # 写完再查一次：让模型判断本期是否与 30 天内内容重复，重复的段落重写一次（理财每天要讲，不查）
+    try:
+        listing = "\n".join(f"{i}. {s['title']}：{'；'.join(s['heads'])}" for i, s in enumerate(sections) if s["title"] != "理财观察")
+        verdict, _ = gemini.generate(f"""已播内容（最近 30 天）：\n{'；'.join(dedupe.titles(covered))}\n\n本期各段：\n{listing}\n\n判断本期哪些条目与已播内容讲的是同一件事或同一知识点（有重大新进展的不算）。只输出 JSON：{{{{"repeats": [{{{{"section": 段落序号, "title": "重复的条目"}}}}]}}}}，没有重复时 repeats 为空数组。""".replace("{{", "{").replace("}}", "}"))
+        m = re.search(r"\{.*\}", verdict, re.S)
+        repeats = json.loads(m.group(0)).get("repeats", []) if m else []
+        by_sec = {}
+        for r in repeats:
+            by_sec.setdefault(int(r["section"]), []).append(str(r["title"]))
+        for i, dup in by_sec.items():
+            print(f"  查重：{sections[i]['title']} 重复 {dup}，重写")
+            title, minutes, brief, av, items = sections[i]["plan"]
+            sections[i] = write_section(ctx, title, minutes, brief + "\n\n【必须换掉，不得再讲】" + "；".join(dup), av or avoid, items)
+    except (ValueError, KeyError, TypeError, IndexError, RuntimeError) as e:
+        print("查重跳过：", repr(e))
 
     outline = "\n".join(f"{s['title']}：{'、'.join(s['heads'][:4])}" for s in sections)
     oc, _ = gemini.generate(f"""你是「澳洲新生活·每日观察」的主播。今天北京时间 {args.date}，{SLOT_CN[args.slot]}。本期各段内容要点：
@@ -209,7 +233,7 @@ def main():
         json.dump(meta, f, ensure_ascii=False, indent=1)
 
     eps.append({"date": args.date, "slot": args.slot, "name": name,
-                "heads": [h for s in sections if s["title"] not in ("澳洲文化与历史", "澳洲生活小课堂", "理财观察") for h in s["heads"]],
+                "heads": [h for s in sections if s["title"] != "理财观察" for h in s["heads"]],
                 "culture": picks["culture"] or (sections[1]["heads"] or [""])[0],
                 "industry": picks["industry"] or (sections[2]["heads"] or [""])[0],
                 "life": picks["life"] or (sections[3]["heads"] or [""])[0]})
@@ -217,6 +241,8 @@ def main():
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
     with open(STATE, "w", encoding="utf-8") as f:
         json.dump(hist, f, ensure_ascii=False, indent=1)
+    dedupe.append([{"date": args.date, "slot": args.slot, "section": s["title"], "title": u["title"], "source": u["source"]}
+                   for s in sections if s["title"] != "理财观察" for u in s["used"]])
     print(f"完成：{name}（{len(spoken)} 字）")
 
 

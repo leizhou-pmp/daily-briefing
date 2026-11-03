@@ -8,6 +8,7 @@ import urllib.request
 
 BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 _candidates = None
+_dead = set()
 
 
 def candidates():
@@ -46,25 +47,24 @@ def _call(model, body):
         headers={"Content-Type": "application/json", "x-goog-api-key": os.environ["GEMINI_API_KEY"]},
     )
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=150) as r:
+    with urllib.request.urlopen(req, timeout=120) as r:
         data = json.load(r)
     print("  [%s] %.0fs" % (model, time.time() - t0), flush=True)
     return data
 
 
-def generate(prompt, search=True, temperature=0.7, max_tokens=8192, retries=5):
-    """返回 (正文, 来源列表[{title, uri}])。"""
+def generate(prompt, search=False, temperature=0.7, max_tokens=8192, rounds=4):
+    """返回 (正文, 来源列表[{title, uri}])。各模型轮流试：高峰期 503 很常见，不在一个模型上死等。"""
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
     }
     if search:
         body["tools"] = [{"google_search": {}}]
-    cands = candidates()
-    while cands:
-        model = cands[0]
-        delay = 15
-        for attempt in range(retries):
+    for attempt in range(rounds):
+        for model in list(candidates())[:6]:
+            if model in _dead:
+                continue
             try:
                 data = _call(model, body)
                 cand = data["candidates"][0]
@@ -75,18 +75,12 @@ def generate(prompt, search=True, temperature=0.7, max_tokens=8192, retries=5):
                 return text.strip(), [c["web"] for c in chunks if "web" in c]
             except urllib.error.HTTPError as e:
                 msg = e.read().decode(errors="ignore")
-                # 额度为 0 或日额度用完：换下一个模型；分钟级限速：等一会儿重试
-                if e.code == 429 and ("limit: 0" in msg or "PerDay" in msg) or e.code in (400, 403, 404):
-                    print("模型 %s 不可用 (%s)，换下一个" % (model, e.code))
-                    break
-                if e.code not in (429, 500, 502, 503, 504):
-                    raise RuntimeError("Gemini %s: %s" % (e.code, msg[:500]))
-                print("%s %s，%ss 后重试" % (model, e.code, delay))
+                if e.code in (400, 403, 404) or (e.code == 429 and ("limit: 0" in msg or "PerDay" in msg)):
+                    _dead.add(model)  # 额度为 0 或日额度用完，本次运行不再试
+                print("%s %s，换下一个" % (model, e.code), flush=True)
             except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
-                print("%s 出错 %r，%ss 后重试" % (model, e, delay))
-            time.sleep(delay)
-            delay = min(delay * 2, 90)
-        else:
-            print("模型 %s 多次失败，换下一个" % model)
-        cands.pop(0)
+                print("%s 出错 %r，换下一个" % (model, e), flush=True)
+            time.sleep(3)
+        print("第 %d 轮全部失败，等待 60s" % (attempt + 1), flush=True)
+        time.sleep(60)
     raise RuntimeError("所有 Gemini 模型都不可用")

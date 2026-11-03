@@ -7,6 +7,9 @@ on:
     - cron: "0,30 19-22 * * *"
     # 晚报：北京时间 12:00–16:00 每半小时一次 → 统一等到 17:00 发出
     - cron: "0,30 4-8 * * *"
+  push:   # 云端定时任务改写这个文件来触发，比 GitHub 自带定时准
+    branches: [main]
+    paths: [state/trigger.txt]
   workflow_dispatch:
     inputs:
       slot:
@@ -14,6 +17,10 @@ on:
         type: choice
         options: [morning, evening]
         default: morning
+      date:
+        description: "补发某天，格式 YYYY-MM-DD（留空为今天）"
+        type: string
+        default: ""
       send_now:
         description: "生成完立即发送（不等到 7:30 / 17:00）"
         type: boolean
@@ -31,7 +38,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 600
     environment:
       name: github-pages
     env:
@@ -70,8 +77,8 @@ jobs:
           echo "SEND_AT=$(TZ=Asia/Shanghai date -d "today $T" +%s)" >> $GITHUB_ENV
 
       - name: 写稿（新闻素材 + Gemini）
-        timeout-minutes: 35
-        run: python -m briefing.generate --slot "$SLOT"
+        timeout-minutes: 60
+        run: python -m briefing.generate --slot "$SLOT" ${{ inputs.date && format('--date {0}', inputs.date) || '' }}
 
       - name: 检查是否有新一期
         id: chk
@@ -101,6 +108,11 @@ jobs:
       - uses: actions/deploy-pages@v4
         if: steps.chk.outputs.new == 'true'
 
+      - uses: actions/cache@v4
+        if: steps.chk.outputs.new == 'true'
+        with:
+          path: ~/quark-skill/scripts
+          key: quark-cli-v1
       - name: 上传夸克网盘
         if: steps.chk.outputs.new == 'true'
         continue-on-error: true

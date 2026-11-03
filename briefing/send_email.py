@@ -28,7 +28,7 @@ def main():
 <div style="color:#666">澳洲新生活·每日观察 · {meta['date']} {meta['slot_cn']}</div>
 <p><a href="{play_url}" style="display:inline-block;background:#0a7c66;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:600">▶ 打开倍速播放（0.8x–2x，记住进度）</a></p>
 <ol>{outline}</ol>
-<p style="color:#888;font-size:13px">音频和文字稿同时存入夸克网盘「每日新闻播报」。</p>
+<p style="color:#888;font-size:13px">音频同时存入夸克网盘「每日新闻播报」。</p>
 </div>"""
 
     msg = EmailMessage()
