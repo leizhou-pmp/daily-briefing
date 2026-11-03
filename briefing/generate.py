@@ -92,6 +92,16 @@ def write_section(ctx, title, minutes, brief, avoid, items=()):
         if item:
             sources.append({"title": item["title"], "uri": item["link"]})
     target = minutes * CHARS_PER_MIN
+    try:
+        body = adjust_length(body, target)
+    except RuntimeError as e:  # 扩写/压缩只是锦上添花，失败就用原稿
+        print(f"  {title}: 调整篇幅失败，用原稿 {e}")
+    print(f"  {title}: {len(body)} 字, {len(heads)} 条要点")
+    return {"title": title, "body": body, "heads": heads, "used": used, "sources": sources,
+            "plan": (title, minutes, brief, avoid, items)}
+
+
+def adjust_length(body, target):
     if len(body) < target * 0.7:  # 太短就让模型扩写一次
         more, s2 = gemini.generate(
             f"下面这段口播稿只有 {len(body)} 字，请在不改变事实的前提下扩写到约 {int(target)} 字，"
@@ -103,9 +113,7 @@ def write_section(ctx, title, minutes, brief, avoid, items=()):
             f"下面这段口播稿有 {len(body)} 字，请压缩到约 {int(target)} 字：保留最重要的事实、判断和对听众的影响，"
             f"删掉次要细节和铺垫。保持简洁播报风格，直接输出压缩后的全文，不要任何说明。\n\n{body}", search=False)
         body = re.sub(r"[*#>`_]+", "", short).strip()
-    print(f"  {title}: {len(body)} 字, {len(heads)} 条要点")
-    return {"title": title, "body": body, "heads": heads, "used": used, "sources": sources,
-            "plan": (title, minutes, brief, avoid, items)}
+    return body
 
 
 def main():
@@ -168,7 +176,15 @@ def main():
     print(f"生成 {args.date} {SLOT_CN[args.slot]} ...")
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=int(os.environ.get("GEN_WORKERS", "2"))) as pool:
-        sections = list(pool.map(lambda row: write_section(ctx, *row), plan))
+        def safe(row):
+            try:
+                return write_section(ctx, *row)
+            except RuntimeError as e:
+                print(f"  {row[0]}: 生成失败，本期跳过该段 {e}")
+                return None
+        sections = [x for x in pool.map(safe, plan) if x]
+    if len(sections) < 4:
+        raise RuntimeError(f"只写成 {len(sections)} 段，放弃本期")
 
     # 写完再查一次：让模型判断本期是否与 30 天内内容重复，重复的段落重写一次（理财每天要讲，不查）
     try:
@@ -187,7 +203,9 @@ def main():
         print("查重跳过：", repr(e))
 
     outline = "\n".join(f"{s['title']}：{'、'.join(s['heads'][:4])}" for s in sections)
-    oc, _ = gemini.generate(f"""你是「澳洲新生活·每日观察」的主播。今天北京时间 {args.date}，{SLOT_CN[args.slot]}。本期各段内容要点：
+    oc = ""
+    try:
+        oc, _ = gemini.generate(f"""你是「澳洲新生活·每日观察」的主播。今天北京时间 {args.date}，{SLOT_CN[args.slot]}。本期各段内容要点：
 {outline}
 
 {STYLE}
@@ -196,6 +214,8 @@ def main():
 {{"opening": "开场，约 100 字：一句报日期和早报/晚报，然后直接列出今天三个最重要的看点，不寒暄",
   "closing": "结尾，约 120 字：三条今天的核心结论，加一件今天可以做的事，一句结束语",
   "theme": "本期最重要的一条新闻的主题，4 到 10 个汉字，用于文件名，不要标点"}}""", search=False)
+    except RuntimeError as e:
+        print("开场/结尾生成失败，用默认文案：", e)
     m = re.search(r"\{.*\}", oc, re.S)
     try:
         j = json.loads(m.group(0)) if m else {}
@@ -204,7 +224,7 @@ def main():
     clean = lambda t: re.sub(r"[*#>`_]+", "", str(t or "")).strip()
     opening = clean(j.get("opening")) or f"今天是{args.date}，{SLOT_CN[args.slot]}。"
     closing = clean(j.get("closing")) or "以上是今天的内容，下期见。"
-    theme = re.sub(r"[^\w一-鿿]", "", clean(j.get("theme")))[:10] or re.sub(r"[^\w一-鿿]", "", sections[0]["heads"][0])[:10]
+    theme = re.sub(r"[^\w一-鿿]", "", clean(j.get("theme")))[:10] or re.sub(r"[^\w一-鿿]", "", (sections[0]["heads"] or [sections[0]["title"]])[0])[:10]
 
     name = f"{args.date}_{SLOT_CN[args.slot]}_{theme}"
     spoken = "\n\n".join([opening] + [s["body"] for s in sections] + [closing])
@@ -234,9 +254,9 @@ def main():
 
     eps.append({"date": args.date, "slot": args.slot, "name": name,
                 "heads": [h for s in sections if s["title"] != "理财观察" for h in s["heads"]],
-                "culture": picks["culture"] or (sections[1]["heads"] or [""])[0],
-                "industry": picks["industry"] or (sections[2]["heads"] or [""])[0],
-                "life": picks["life"] or (sections[3]["heads"] or [""])[0]})
+                **{k: picks[k] or next(((s["heads"] or [""])[0] for s in sections if s["title"] == t), "")
+                   for k, t in (("culture", "澳洲文化与历史"), ("industry", "行业观察"), ("life", "澳洲生活小课堂"))
+                   if picks[k] or any(s["title"] == t for s in sections)}})
     hist["episodes"] = eps[-200:]
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
     with open(STATE, "w", encoding="utf-8") as f:

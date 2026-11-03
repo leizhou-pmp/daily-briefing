@@ -47,13 +47,13 @@ def _call(model, body):
         headers={"Content-Type": "application/json", "x-goog-api-key": os.environ["GEMINI_API_KEY"]},
     )
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=90) as r:
         data = json.load(r)
     print("  [%s] %.0fs" % (model, time.time() - t0), flush=True)
     return data
 
 
-def generate(prompt, search=False, temperature=0.7, max_tokens=8192, rounds=4):
+def generate(prompt, search=False, temperature=0.7, max_tokens=8192, rounds=6):
     """返回 (正文, 来源列表[{title, uri}])。各模型轮流试：高峰期 503 很常见，不在一个模型上死等。"""
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -62,9 +62,8 @@ def generate(prompt, search=False, temperature=0.7, max_tokens=8192, rounds=4):
     if search:
         body["tools"] = [{"google_search": {}}]
     for attempt in range(rounds):
-        for model in list(candidates())[:6]:
-            if model in _dead:
-                continue
+        # 每轮从还可用的模型里取前 8 个（含 flash-lite），前面的都挂了也能用后面的
+        for model in [m for m in candidates() if m not in _dead][:8]:
             try:
                 data = _call(model, body)
                 cand = data["candidates"][0]
@@ -81,6 +80,7 @@ def generate(prompt, search=False, temperature=0.7, max_tokens=8192, rounds=4):
             except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
                 print("%s 出错 %r，换下一个" % (model, e), flush=True)
             time.sleep(3)
-        print("第 %d 轮全部失败，等待 60s" % (attempt + 1), flush=True)
-        time.sleep(60)
+        wait = min(60 * (attempt + 1), 180)  # 高峰期过载通常几分钟就缓解
+        print("第 %d 轮全部失败，等待 %ds" % (attempt + 1, wait), flush=True)
+        time.sleep(wait)
     raise RuntimeError("所有 Gemini 模型都不可用")
