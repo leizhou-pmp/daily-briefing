@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>每日观察播放器</title>
+<style>
+  :root { --bg:#f6f5f2; --card:#fff; --fg:#1d1d1f; --muted:#6e6e73; --accent:#0a7c66; --line:#e3e1dc; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --card:#1c1c1e; --fg:#f2f2f2; --muted:#9a9aa0; --accent:#3cc4a4; --line:#2c2c2e; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:14px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:14px; }
+  audio { width:100%; margin:12px 0 8px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; }
+  button { font:inherit; border:1px solid var(--line); background:transparent; color:var(--fg); border-radius:10px; padding:8px 12px; min-width:52px; cursor:pointer; }
+  button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .skip { flex:1; }
+  ol { padding-left:20px; margin:8px 0 0; font-size:14px; color:var(--muted); }
+  .ep { display:block; padding:10px 0; border-top:1px solid var(--line); color:var(--fg); text-decoration:none; }
+  .ep:first-child { border-top:0; }
+  .ep.cur { color:var(--accent); font-weight:600; }
+  .ep small { color:var(--muted); display:block; }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1 id="title">加载中…</h1>
+    <div class="sub" id="sub"></div>
+    <audio id="a" controls preload="metadata"></audio>
+    <div class="row" id="speeds"></div>
+    <div class="row" style="margin-top:8px">
+      <button class="skip" id="back">« 15 秒</button>
+      <button class="skip" id="fwd">30 秒 »</button>
+    </div>
+    <ol id="outline"></ol>
+  </div>
+  <div class="card"><div class="sub" style="margin-bottom:4px">最近节目</div><div id="list"></div></div>
+</main>
+<script>
+const SPEEDS = [0.8, 1, 1.25, 1.5, 1.75, 2];
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+const a = document.getElementById('a');
+let speed = store.get('speed', 1.25);
+
+function renderSpeeds() {
+  const box = document.getElementById('speeds');
+  box.innerHTML = '';
+  SPEEDS.forEach(s => {
+    const b = document.createElement('button');
+    b.textContent = s + 'x';
+    if (s === speed) b.className = 'on';
+    b.onclick = () => { speed = s; a.playbackRate = s; store.set('speed', s); renderSpeeds(); };
+    box.appendChild(b);
+  });
+}
+
+fetch('episodes.json', { cache: 'no-store' }).then(r => r.json()).then(eps => {
+  const want = new URLSearchParams(location.search).get('ep');
+  const ep = eps.find(e => e.name === want) || eps[0];
+  if (!ep) { document.getElementById('title').textContent = '暂无节目'; return; }
+  document.title = ep.name;
+  document.getElementById('title').textContent = ep.theme || ep.name;
+  document.getElementById('sub').textContent = ep.date + ' ' + ep.slot_cn;
+  document.getElementById('outline').innerHTML = (ep.outline || [])
+    .map(s => '<li>' + s.title + (s.heads && s.heads.length ? '：' + s.heads.slice(0, 3).join('、') : '') + '</li>').join('');
+  a.src = 'audio/' + encodeURIComponent(ep.name) + '.mp3';
+  const posKey = 'pos:' + ep.name;
+  a.addEventListener('loadedmetadata', () => { a.currentTime = store.get(posKey, 0); a.playbackRate = speed; });
+  a.addEventListener('play', () => { a.playbackRate = speed; });
+  a.addEventListener('timeupdate', () => { if (Math.floor(a.currentTime) % 5 === 0) store.set(posKey, a.currentTime); });
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({ title: ep.theme || ep.name, artist: '澳洲新生活·每日观察', album: ep.date + ' ' + ep.slot_cn });
+    navigator.mediaSession.setActionHandler('seekbackward', () => { a.currentTime -= 15; });
+    navigator.mediaSession.setActionHandler('seekforward', () => { a.currentTime += 30; });
+  }
+  document.getElementById('list').innerHTML = eps.map(e =>
+    '<a class="ep' + (e === ep ? ' cur' : '') + '" href="?ep=' + encodeURIComponent(e.name) + '">' +
+    (e.theme || e.name) + '<small>' + e.date + ' ' + e.slot_cn + '</small></a>').join('');
+}).catch(() => { document.getElementById('title').textContent = '加载失败，请刷新'; });
+
+document.getElementById('back').onclick = () => { a.currentTime = Math.max(0, a.currentTime - 15); };
+document.getElementById('fwd').onclick = () => { a.currentTime += 30; };
+renderSpeeds();
+</script>
+</body>
+</html>
